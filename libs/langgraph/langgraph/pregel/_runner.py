@@ -78,7 +78,7 @@ class FuturesDict(Generic[F, E], dict[F, PregelExecutableTask | None]):
     # Stop condition is injected by PregelRunner instead of hard-coded here.
     # This lets the runner treat graph-error-handled exceptions as non-fatal
     # so `on_done` does not trigger an early stop for those futures.
-    should_stop: Callable[[set[F]], bool]
+    should_stop: Callable[[F], bool]
     counter: int
     done: set[F]
     lock: threading.Lock
@@ -89,7 +89,7 @@ class FuturesDict(Generic[F, E], dict[F, PregelExecutableTask | None]):
         callback: weakref.ref[
             Callable[[PregelExecutableTask, BaseException | None], None]
         ],
-        should_stop: Callable[[set[F]], bool],
+        should_stop: Callable[[F], bool],
         future_type: type[F],
         # used for generic typing, newer py supports FutureDict[...](...)
     ) -> None:
@@ -100,6 +100,12 @@ class FuturesDict(Generic[F, E], dict[F, PregelExecutableTask | None]):
         self.should_stop = should_stop
         self.counter = 0
         self.done: set[F] = set()
+        # Latches once a completed future has requested a runner-level stop. The
+        # original code re-derived this on every completion by rescanning the
+        # whole done set, which also re-set the event after __setitem__ cleared
+        # it for a newly registered future. We keep the O(1) per-completion check
+        # but must preserve that level-triggered behavior, so remember it here.
+        self.stop_requested = False
 
     def __setitem__(
         self,
@@ -111,6 +117,9 @@ class FuturesDict(Generic[F, E], dict[F, PregelExecutableTask | None]):
             with self.lock:
                 self.event.clear()
                 self.counter += 1
+                # A later registration must not mask a stop that already fired.
+                if self.stop_requested:
+                    self.event.set()
             key.add_done_callback(partial(self.on_done, value))
 
     def on_done(
@@ -128,7 +137,14 @@ class FuturesDict(Generic[F, E], dict[F, PregelExecutableTask | None]):
                 self.counter -= 1
                 # Wake waiter when all tracked futures are done, or when runner-level
                 # stop condition is met (for example, a non-handled fatal exception).
-                if self.counter == 0 or self.should_stop(self.done):
+                # A completed future's failure state is immutable, and previously
+                # accumulated futures were already checked on their own completion,
+                # so only the newly-completed `fut` can newly trigger the stop.
+                # Checking just `fut` keeps this O(1) per completion instead of
+                # rescanning the whole done set (O(tasks^2) per superstep).
+                if not self.stop_requested and self.should_stop(fut):
+                    self.stop_requested = True
+                if self.counter == 0 or self.stop_requested:
                     self.event.set()
 
 
@@ -191,7 +207,7 @@ class PregelRunner:
             callback=weakref.WeakMethod(self.commit),
             event=threading.Event(),
             should_stop=partial(
-                _should_stop_others, handled_exception_ids=self._handled_exception_ids
+                _is_stopping_failure, handled_exception_ids=self._handled_exception_ids
             ),
             future_type=concurrent.futures.Future,
         )
@@ -380,7 +396,7 @@ class PregelRunner:
             callback=weakref.WeakMethod(self.commit),
             event=asyncio.Event(),
             should_stop=partial(
-                _should_stop_others, handled_exception_ids=self._handled_exception_ids
+                _is_stopping_failure, handled_exception_ids=self._handled_exception_ids
             ),
             future_type=asyncio.Future,
         )
@@ -613,6 +629,29 @@ class PregelRunner:
             self.put_writes()(task.id, task.writes)  # type: ignore[misc]
 
 
+def _is_stopping_failure(
+    fut: F,
+    *,
+    handled_exception_ids: set[int] | None = None,
+) -> bool:
+    """Whether a single completed future is a failure that should stop others.
+
+    Cancellations and GraphInterrupts (GraphBubbleUp) are not failures, nor are
+    exceptions already handled by the graph. A completed future's cancelled /
+    exception state is immutable, so this predicate is stable once `fut` is done.
+    """
+    if fut.cancelled():
+        return False
+    exc = fut.exception()
+    if exc is None:
+        return False
+    return (
+        id(exc) not in (handled_exception_ids or set())
+        and not isinstance(exc, GraphBubbleUp)
+        and fut not in SKIP_RERAISE_SET
+    )
+
+
 def _should_stop_others(
     done: set[F],
     *,
@@ -620,18 +659,10 @@ def _should_stop_others(
 ) -> bool:
     """Check if any task failed, if so, cancel all other tasks.
     GraphInterrupts are not considered failures."""
-    for fut in done:
-        if fut.cancelled():
-            continue
-        elif exc := fut.exception():
-            if (
-                id(exc) not in (handled_exception_ids or set())
-                and not isinstance(exc, GraphBubbleUp)
-                and fut not in SKIP_RERAISE_SET
-            ):
-                return True
-
-    return False
+    return any(
+        _is_stopping_failure(fut, handled_exception_ids=handled_exception_ids)
+        for fut in done
+    )
 
 
 def _exception(
